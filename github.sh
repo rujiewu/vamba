@@ -20,4 +20,4 @@ git commit -m "$1"
 git branch -M main
 git push -u origin main
 
-echo "The code has been successfully pushed to GitHub!"
+echo "✅ The code has been successfully pushed to GitHub! ✅"

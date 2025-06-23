@@ -16,12 +16,12 @@ REMOTE_VAMBA_SCRIPT_DIR="$REMOTE_PATH/$(basename "$SCRIPT_DIR")"
 if [ "$1" == "upload" ]; then
     echo "Uploading local to remote server..."
     rsync -avzP --progress --exclude='.*' "$SCRIPT_DIR" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH"
-    echo "Upload completed!"
+    echo "✅ Upload completed! ✅"
 
 elif [ "$1" == "download" ]; then
     echo "Downloading from remote server to local..."
     rsync -avzP --progress --exclude='.*' "$REMOTE_USER@$REMOTE_HOST:$REMOTE_VAMBA_SCRIPT_DIR" "$PARENT_DIR"
-    echo "Download completed!"
+    echo "✅ Download completed! ✅"
 
 else
     echo "bash sync.sh upload   # Upload local to remote server"
