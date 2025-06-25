@@ -11,7 +11,7 @@ if [ ! -d .git ]; then
     git remote add origin "$GIT_REPO_URL"
 fi
 
-echo -e ".git\nckpts\nwandb\noutput\nlogs\n*.log\n*.tmp\n*.cache\n__pycache__/\n.DS_Store\n*.egg-info/\nnode_modules/\n.vscode/\ncheckpoints/\nres/\n\nfake/" > .gitignore
+echo -e ".git\nckpts\nwandb\noutput\nlogs\n*.log\n*.tmp\n*.cache\n__pycache__/\n.DS_Store\n*.egg-info/\nnode_modules/\n.vscode/\ncheckpoints/\nres/\nflash-attention/\ncuda*\nmamba_ssm*" > .gitignore
 
 git add .
 

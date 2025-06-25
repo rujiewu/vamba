@@ -13,5 +13,6 @@ node_modules/
 .vscode/
 checkpoints/
 res/
-
-fake/
+flash-attention/
+cuda*
+mamba_ssm*
