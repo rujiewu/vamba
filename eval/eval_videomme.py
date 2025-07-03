@@ -1,13 +1,73 @@
-import fire
+import os
 import json
+import logging
+import torch
+import torch.distributed as dist
+import fire
 from pathlib import Path
-from eval.utils_videomme import VideoMMEDataset
 from tqdm import tqdm
+from eval.utils_videomme import VideoMMEDataset
+
+
+def setup_dist():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+    return local_rank, world_size
+
+
+def compute_summary(core_data: dict) -> dict:
+    all_items = [item for answers in core_data.values() for item in answers]
+
+    task_stats = {}
+    duration_stats = {}
+    for item in all_items:
+        tt = item["task_type"]
+        task_stats.setdefault(tt, {"correct": 0, "total": 0})
+        task_stats[tt]["total"] += 1
+        if item["correct"]:
+            task_stats[tt]["correct"] += 1
+
+        dur = item["duration"]
+        duration_stats.setdefault(dur, {"correct": 0, "total": 0})
+        duration_stats[dur]["total"] += 1
+        if item["correct"]:
+            duration_stats[dur]["correct"] += 1
+
+    correct_all = sum(v["correct"] for v in task_stats.values())
+    total_all   = sum(v["total"]   for v in task_stats.values())
+
+    logging.info("=== Per-task Accuracy ===")
+    for tt, v in task_stats.items():
+        acc = v["correct"] / v["total"]
+        logging.info(f"  {tt}: {v['correct']}/{v['total']} = {acc:.4f}")
+
+    logging.info("=== Per-duration Accuracy (s) ===")
+    for dur, v in duration_stats.items():
+        acc = v["correct"] / v["total"]
+        logging.info(f"  {dur}s: {v['correct']}/{v['total']} = {acc:.4f}")
+
+    logging.info(f"=== Overall Accuracy: {correct_all}/{total_all} = {correct_all/total_all:.4f}")
+
+    return {
+        "per_task_accuracy": {
+            tt: {"correct": v["correct"], "total": v["total"], "accuracy": v["correct"]/v["total"]}
+            for tt, v in task_stats.items()
+        },
+        "per_duration_accuracy": {
+            dur: {"correct": v["correct"], "total": v["total"], "accuracy": v["correct"]/v["total"]}
+            for dur, v in duration_stats.items()
+        },
+        "overall_accuracy": {"correct": correct_all, "total": total_all, "accuracy": correct_all/total_all}
+    }
+
 
 def main(
     model_type="vamba",
-    model_name_or_path="TIGER-Lab/Vamba-Qwen2-VL-7B",
-    data_dir="/path/to/dataset/videomme",
+    model_name_or_path="ckpts/Vamba-Qwen2-VL-7B",
+    data_dir="/home/wurujie/workspace/dataset/videomme",
     frames_dir=None,
     num_frames=512,
     img_shortest_edge=256,
@@ -15,8 +75,7 @@ def main(
     max_img_seq_len=120000,
     do_resize=True,
     use_subtitle=False,
-    results_dir="./output/eval/videomme",
-    overwrite=False,
+    results_dir="res/videomme",
     # generation config
     max_new_tokens=512,
     do_sample=False,
@@ -24,6 +83,13 @@ def main(
     top_p=0.9,
     temperature=0.6,
 ):
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        level=logging.INFO
+    )
+    torch.manual_seed(42)
+    local_rank, world_size = setup_dist()
+
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -57,98 +123,80 @@ def main(
         "top_p": top_p,
         "temperature": temperature,
     }
-
-    core_data = {}
-
-    model_save_path = "/".join(model_name_or_path.split("/")[-2:])
-    results_file = Path(results_dir) / f"{num_frames}frames" / f"{model_save_path}.jsonl"
-    results_file.parent.mkdir(parents=True, exist_ok=True)
     
-    if results_file.exists() and not overwrite:
-        with open(results_file, "r") as rf:
-            try:
-                core_data = json.load(rf)
-            except json.JSONDecodeError:
-                core_data = {}
+    local_data = {}
+    total = len(dataset)
+    rank_indices = range(local_rank, total, world_size)
     
-    for i in tqdm(range(len(core_data), len(dataset))):
-        data = dataset[i]
-        video_path = data['video_path']
-        if video_path in core_data:
+    if local_rank == 0:
+        rank_iter = tqdm(rank_indices, desc=f"Rank {local_rank}")
+    else:
+        rank_iter = rank_indices
+    
+    for idx in rank_iter:
+        entry = dataset[idx]
+        vid_path = entry["video_path"]
+        if vid_path in local_data:
             continue
 
-        images = data["video"]
+        frames = entry["video"]
+        questions = entry["questions"]
+        answers = []
 
-        questions = data["questions"]
-        video_answers = []   
-
-        for question in questions:
-            text = question["text"]
-            messages = [
-                {
-                    "type": "pil_video",
-                    "content": images
-                },
-                {
-                    "type": "text",
-                    "content": f"<video> {text}",
-                }
+        for q in questions:
+            msgs = [
+                {"type": "pil_video", "content": frames},
+                {"type": "text", "content": f"<video> {q['text']}"}
             ]
-            response = model(messages, generation_config)
-            response = response.lower()
+            with torch.no_grad():
+                resp = model(msgs, generation_config)
 
-        
-            if "the answer is" in response:
-                response = response.split("the answer is")[-1].strip()
-            elif "answer:" in response:
-                response = response.split("answer:")[-1].strip()
-            elif "the option is" in response:
-                response = response.split("the option is ")[-1].strip()
-            for char in response:
-                if char.isalpha():
-                    response = char
-                    break
-            question["correct"] = response[0] == question["answer"] or response[0] == question["answer"].lower() if len(response) > 0 else False
+            opt = next((c for c in resp if c.isalpha()), "")
+            correct = (opt.upper() == q["answer"].upper())
+            q["response"] = resp
+            q["correct"] = correct
+            answers.append(q)
 
-            video_answers.append(question)
+        local_data[vid_path] = answers
         
-        core_data[video_path] = video_answers
-    
+        del frames, answers, msgs, resp, q, opt, correct
+        torch.cuda.empty_cache()
+
+    if world_size > 1:
+        dist.barrier()
+
+    part_dir = results_dir
+    part_dir.mkdir(parents=True, exist_ok=True)
+    part_file = part_dir / f"{Path(model_name_or_path).name}_part{local_rank}.json"
+    with open(part_file, "w") as pf:
+        json.dump(local_data, pf, indent=4)
+
+    local_data.clear()
+    torch.cuda.empty_cache()
+
+    if world_size > 1:
+        dist.barrier()
+
+    if local_rank == 0:
+        merged = {}
+        for r in range(world_size):
+            pf = part_dir / f"{Path(model_name_or_path).name}_part{r}.json"
+            with open(pf) as f:
+                merged.update(json.load(f))
+            pf.unlink()
+
+        results_file = part_dir / f"{Path(model_name_or_path).name}.json"
         with open(results_file, "w") as wf:
-            json.dump(core_data, wf, indent=4)
-        
-    all_questions = []
-    for answers in core_data.values():
-        all_questions.extend(answers) 
-    # print accuracy
-    task_type_dict = {}
-    for item in all_questions:
-        task_type = item["task_type"]
-        if task_type not in task_type_dict:
-            task_type_dict[task_type] = {"correct": 0, "total": 0}
-        task_type_dict[task_type]["total"] += 1
-        if item["correct"]:
-            task_type_dict[task_type]["correct"] += 1
-    for task_type in task_type_dict:
-        print(f"Task Type: {task_type}")
-        print(f"Accuracy: {task_type_dict[task_type]['correct']} / {task_type_dict[task_type]['total']:.4f} = {task_type_dict[task_type]['correct'] / task_type_dict[task_type]['total']:.4f}")
-        print()
-    duration_dict = {}
-    for item in all_questions:
-        duration = item["duration"]
-        if duration not in duration_dict:
-            duration_dict[duration] = {"correct": 0, "total": 0}
-        duration_dict[duration]["total"] += 1
-        if item["correct"]:
-            duration_dict[duration]["correct"] += 1
-    for duration in duration_dict:
-        print(f"Duration: {duration}")
-        print(f"Accuracy: {duration_dict[duration]['correct']} / {duration_dict[duration]['total']:.4f} = {duration_dict[duration]['correct'] / duration_dict[duration]['total']:.4f}")
-        print()
-    all_correct = sum([task_type_dict[task_type]["correct"] for task_type in task_type_dict])
-    all_total = sum([task_type_dict[task_type]["total"] for task_type in task_type_dict])
-    print(f"Overall Accuracy: {all_correct} / {all_total:.4f} = {all_correct / all_total:.4f}")
-        
-        
+            json.dump(merged, wf, indent=4)
+
+        summary = compute_summary(merged)
+        summary_file = results_file.with_name(results_file.stem + "_summary.json")
+        with open(summary_file, "w") as sf:
+            json.dump(summary, sf, indent=4)
+
+    if world_size > 1:
+        dist.barrier()
+
+
 if __name__ == "__main__":
     fire.Fire(main)

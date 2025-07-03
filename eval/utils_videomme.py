@@ -216,9 +216,9 @@ class VideoMMEDataset(Dataset):
         self.data_dict = {}
         value_keys = ['question_id', 'duration', 'task_type', 'question', 'options', 'answer']
         if 'filtered' not in sample_config or sample_config['filtered'] != True:
-            df = read_parquet(osp.join(dataset_path, 'videomme', 'test-00000-of-00001.parquet'))
+            df = read_parquet(osp.join(dataset_path, 'test-00000-of-00001.parquet'))
         else:
-            df = read_parquet(osp.join(dataset_path, 'videomme', 'test-00000-of-00001-filtered.parquet'))
+            df = read_parquet(osp.join(dataset_path, 'test-00000-of-00001-filtered.parquet'))
         df['options'] = df['options'].apply(list)
         for _, data in df.iterrows():
             key = data['videoID']
@@ -244,7 +244,7 @@ class VideoMMEDataset(Dataset):
             )
         else:
             frames, durations = load_decord(
-                src_path=osp.join(self.dataset_path, 'data', video_path + '.mp4'),
+                src_path=osp.join(self.dataset_path, 'videos', video_path + '.mp4'),
                 **self.sample_config
             )
 

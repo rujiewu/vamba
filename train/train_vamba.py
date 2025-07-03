@@ -26,6 +26,121 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
 
+
+
+# ImageEvalCallback
+# ===============================================================================
+from PIL import Image, ImageDraw, ImageFont
+from transformers import TrainerCallback
+from deepspeed.runtime.zero.partition_parameters import GatheredParameters
+import torch.distributed as dist
+
+class ImageEvalCallback(TrainerCallback):
+    """
+    Every eval_interval steps, runs VQA on a fixed set of images
+    using the current training model, and saves annotated output.
+    """
+    def __init__(self, eval_interval, save_folder, image_folder, image_files, prompt, processor):
+        self.eval_interval = eval_interval
+        self.save_folder   = save_folder
+        self.image_folder  = image_folder
+        self.image_files   = image_files
+        self.prompt        = prompt
+        self.font          = ImageFont.truetype(
+            "/home/wurujie/workspace/code/vamba/NotoSansCJKtc-Regular.otf", size=16
+        )
+        self.processor     = processor
+
+    def on_step_end(self, args, state, control, **kwargs):
+        step = state.global_step
+        if step % self.eval_interval != 0:
+            return control
+
+        print(f"<HERE>: step % {self.eval_interval} == 0")
+        model = kwargs["model"]
+        model.eval()
+
+        for img_name in self.image_files:
+            img_path = os.path.join(self.image_folder, img_name)
+            print(f"[EvalCallback] Step={step}, loading {img_path} (exists? {os.path.exists(img_path)})")
+
+            pil = Image.open(img_path).convert("RGB")
+            inputs = self.processor(
+                images=pil,
+                text=self.prompt,
+                return_tensors="pt"
+            )
+            for k, v in inputs.items():
+                inputs[k] = v.to(model.device)
+
+            gather_ctx = GatheredParameters(list(model.parameters()), modifier_rank=dist.get_rank())
+
+            with gather_ctx:
+                with torch.no_grad():
+                    gen = model.generate(
+                        **inputs,
+                        max_new_tokens=16,
+                        do_sample=False,
+                        temperature=1.0,
+                        top_p=1.0,
+                        top_k=0,
+                    )
+
+            answer = self.processor.tokenizer.decode(
+                gen[0], skip_special_tokens=True
+            ).strip()
+            print(f"→ {img_name} → {answer}")
+
+            pil_img = pil.resize((224, 224))
+            margin = 20
+            cell_w, cell_h = 224, 224
+            tick_len, tick_intv = 10, 32
+
+            lines = self.prompt.split("\n") + ["", f"Prediction: {answer}"]
+            max_w = max(self.font.getsize(l)[0] for l in lines)
+            panel_w = max(cell_w, max_w + 2 * margin)
+            line_h = self.font.getsize("A")[1]
+            panel_h = len(lines) * line_h + 2 * margin
+
+            canvas_w = margin + cell_w + margin + panel_w + margin
+            canvas_h = margin + max(cell_h, panel_h) + margin
+            canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
+            draw = ImageDraw.Draw(canvas)
+
+            gx0, gy0 = margin, margin
+            gx1, gy1 = gx0 + cell_w, gy0 + cell_h
+            draw.rectangle([gx0, gy0, gx1, gy1], outline="black")
+            for i in range(0, cell_w + 1, tick_intv):
+                draw.line([(gx0 + i, gy0), (gx0 + i, gy0 - tick_len)], fill="black")
+                draw.line([(gx0 + i, gy1), (gx0 + i, gy1 + tick_len)], fill="black")
+            for j in range(0, cell_h + 1, tick_intv):
+                draw.line([(gx0, gy0 + j), (gx0 - tick_len, gy0 + j)], fill="black")
+                draw.line([(gx1, gy0 + j), (gx1 + tick_len, gy0 + j)], fill="black")
+
+            canvas.paste(pil_img, (gx0, gy0))
+
+            px0, py0 = gx1 + margin, margin
+            draw.rectangle([px0, py0, px0 + panel_w, py0 + panel_h], outline="black")
+            ty = py0 + margin
+            for line in lines:
+                draw.text((px0 + margin, ty), line, font=self.font, fill="black")
+                ty += line_h
+
+            base = os.path.splitext(img_name)[0]
+            save_name = f"{base}_{step}.png"
+            save_dir = os.path.join("test", self.save_folder.split('/')[1])
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, save_name)
+            canvas.save(save_path)
+            print(f"[EvalCallback] Step={step} → saved {save_name}")
+
+        model.train()
+        torch.cuda.empty_cache()
+        return control
+# ===============================================================================
+
+
+
 @dataclass
 class DataArguments:
     max_img_seq_len: Optional[int] = field(
@@ -97,7 +212,8 @@ class ModelArguments:
         metadata={"help": "The conversation template to use", "default": None, "required": False},
         default=None,
     )
-    init_cross_attn_weights_from_self_attn : Optional[bool] = field(
+    
+     : Optional[bool] = field(
         metadata={"help": "Whether to initialize cross attention weights from self attention layers", "default": False, "required": False},
         default=False,
     )
@@ -223,7 +339,8 @@ def main(
     data_args: DataArguments,
     model_args: ModelArguments,
 ):
-    training_args.output_dir = Path(training_args.output_dir) / model_args.model_name_or_path.split("/")[-1] / training_args.run_name
+    # training_args.output_dir = Path(training_args.output_dir) / model_args.model_name_or_path.split("/")[-1] / training_args.run_name
+    training_args.output_dir = Path(training_args.output_dir)
     
     training_args.output_dir.mkdir(parents=True, exist_ok=True)
     training_args.output_dir = str(training_args.output_dir)
@@ -270,6 +387,36 @@ def main(
         data_collator=collate_fn,
         tokenizer=processor,
     )
+
+    # # ImageEvalCallback
+    # # ===============================================================================
+    # eval_callback = ImageEvalCallback(
+    # eval_interval = training_args.save_steps,
+    # save_folder   = training_args.output_dir,
+    # image_folder  = "/home/wurujie/workspace/code/vamba/test",
+    # image_files   = ["cat.png", "dog.png", "person.png", "radar.png"],
+    # prompt        = (
+    #         "What is the object in this image?\n"
+    #         "A. Cat\n"
+    #         "B. Dog\n"
+    #         "C. Person\n"
+    #         "D. Radar Chart\n"
+    #         "Answer with the option's letter from the given choices directly."
+    #     ),
+    #     processor = processor,
+    # )
+
+    # trainer = HfMultiTaskTrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset,
+    #     eval_dataset=val_dataset,
+    #     data_collator=collate_fn,
+    #     tokenizer=processor,
+    #     callbacks=[eval_callback],
+    # )
+    # # ===============================================================================
+
     if trainer.is_world_process_zero():
         print("Training arguments:")
         print(training_args)

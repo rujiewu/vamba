@@ -9,10 +9,6 @@ logs
 __pycache__/
 .DS_Store
 *.egg-info/
-node_modules/
 .vscode/
-checkpoints/
 res/
 flash-attention/
-cuda*
-mamba_ssm*

@@ -1,0 +1,11 @@
+data:
+  - 
+    name: llavaov_image
+    format: conversation_packed
+    split: train
+    json_path: /home/wurujie/workspace/dataset/llavaov/image_mm_1258k_wh28_1077k.jsonl
+    data_path: /home/wurujie/workspace/dataset/llavaov
+    dataset_type: image
+    img_do_resize: True
+    pack_size: 8
+    shuffle: True
