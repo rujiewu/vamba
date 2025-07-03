@@ -212,8 +212,7 @@ class ModelArguments:
         metadata={"help": "The conversation template to use", "default": None, "required": False},
         default=None,
     )
-    
-     : Optional[bool] = field(
+    init_cross_attn_weights_from_self_attn : Optional[bool] = field(
         metadata={"help": "Whether to initialize cross attention weights from self attention layers", "default": False, "required": False},
         default=False,
     )
