@@ -216,6 +216,10 @@ class ModelArguments:
         metadata={"help": "Whether to initialize cross attention weights from self attention layers", "default": False, "required": False},
         default=False,
     )
+    init_flex_attn_weights_from_self_attn : Optional[bool] = field(
+        metadata={"help": "Whether to initialize flex attention weights from self attention layers", "default": False, "required": False},
+        default=False,
+    )
     enable_vision_mamba_mixer : Optional[bool] = field(
         metadata={"help": "Whether to enable mamba mixer layers in LLM decoder", "default": False, "required": False},
         default=False,
@@ -293,6 +297,11 @@ def load_model(model_args, training_args):
         print("Initializing cross attention weights from self attention layers...")
         model.init_cross_attn_from_self_attn()
         print("Successfully initialized cross attention weights from self attention layers")
+    
+    if model_args.init_flex_attn_weights_from_self_attn:
+        print("Initializing flex attention weights from self attention layers...")
+        model.init_flex_attn_from_self_attn()
+        print("Successfully initialized flex attention weights from self attention layers")
 
     if model_args.trainable_modules != "all":
         trainable_modules = [x.strip() for x in model_args.trainable_modules.split(",")]
@@ -308,6 +317,7 @@ def load_model(model_args, training_args):
             model.enable_input_require_grads()
     else:
         print("Tuning all modules")
+
     print("Successfully loaded model from:", model_args.model_name_or_path)
 
     if bnb_config:

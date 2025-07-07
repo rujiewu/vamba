@@ -20,7 +20,6 @@
 """PyTorch Qwen2-VL model."""
 
 import os
-import re
 import math
 import time
 from functools import partial
@@ -1602,170 +1601,157 @@ QWEN2_VL_CROSSATTN_CLASSES = {
     "sdpa": Qwen2VLSdpaCrossAttention,
 }
 
-
-class Qwen2FlexAttention(nn.Module):
-    def __init__(self, config, layer_idx: int = 0, debug: bool = False):
-        super().__init__()
-        self.layer_idx      = layer_idx
-        self.hidden_size    = config.hidden_size
-        self.num_heads      = config.num_attention_heads
-        self.head_dim       = self.hidden_size // self.num_heads
-        self.num_kv_heads   = config.num_key_value_heads
-        self.num_kv_groups  = self.num_heads // self.num_kv_heads
-        self.dropout_p      = config.attention_dropout
-        self.debug          = debug
-
-        self.q_proj = nn.Linear(self.hidden_size,  self.num_heads    * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size,  self.num_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size,  self.num_kv_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size,   bias=False)
-
-        self.rotary_emb    = Qwen2VLRotaryEmbedding(config=config)
-        self.apply_mm_rope = apply_multimodal_rotary_pos_emb
-        self.repeat_kv     = repeat_kv
-        self.mrope_section = config.rope_scaling["mrope_section"]
-
-        if self.debug:
-            torch.autograd.set_detect_anomaly(True)
-
-    def _log(self, name: str, tensor: torch.Tensor):
-        t = tensor.detach()
-        if t.dtype == torch.bool:
-            total = t.numel()
-            n_true = int(t.sum().item())
-            print(f"[L{self.layer_idx}] {name}: shape={tuple(t.shape)}, dtype={t.dtype}, "
-                  f"true={n_true}/{total} ({n_true/total:.2%})")
-        else:
-            t_float = t.float()
-            print(f"[L{self.layer_idx}] {name}: shape={tuple(t.shape)}, dtype={t.dtype}, "
-                  f"min={t_float.min().item():.4e}, max={t_float.max().item():.4e}, "
-                  f"mean={t_float.mean().item():.4e}")
-
-    def forward(
-        self,
-        fusion: torch.Tensor,                           # (1, L_full, D)
-        position_ids_full: torch.LongTensor,            # (1, L_full)
-        multimodal_mask: torch.Tensor,                  # (1, L_full)
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-    ):
-        if self.debug:
-            self._log("fusion", fusion)
-
-        B, L_full, _ = fusion.shape
-
-        q = self.q_proj(fusion)
-        k = self.k_proj(fusion)
-        v = self.v_proj(fusion)
-        if self.debug:
-            self._log("q_proj out", q)
-            self._log("k_proj out", k)
-            self._log("v_proj out", v)
-
-        q = q.view(B, L_full, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L_full, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L_full, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        if self.debug:
-            self._log("q shaped", q)
-            self._log("k shaped", k)
-            self._log("v shaped", v)
-
-        cos, sin = self.rotary_emb(v, position_ids_full.unsqueeze(0).expand(3, -1, -1))
-        q, k = self.apply_mm_rope(q, k, cos, sin, self.mrope_section)
-        if self.debug:
-            self._log("q after RoPE", q)
-            self._log("k after RoPE", k)
-
-        k = self.repeat_kv(k, self.num_kv_groups)
-        v = self.repeat_kv(v, self.num_kv_groups)
-        if self.debug:
-            self._log("k after repeat_kv", k)
-            self._log("v after repeat_kv", v)
-
-        text_mask = ~multimodal_mask[0]
-        q = q[:, :, text_mask, :]                   # (B, H, L_txt, D)
-        if self.debug:
-            self._log("text_mask", text_mask)
-            self._log("q after text_mask", q)
-
-        L_txt = q.size(2)
-        causal = torch.tril(torch.ones(L_txt, L_txt, device=q.device, dtype=torch.bool))
-        prefix = torch.zeros(L_txt, L_full - L_txt, dtype=torch.bool, device=q.device)
-        attn_mask = torch.cat([prefix, ~causal], dim=1)
-        if attention_mask is not None:
-            attn_mask |= attention_mask.squeeze(0).bool()[:L_txt]
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(1)
-        if self.debug:
-            self._log("attn_mask", attn_mask)
-
-        try:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=~attn_mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=False
-            )
-        except Exception as e:
-            print(f"[L{self.layer_idx}] ERROR in scaled_dot_product_attention:", e)
-            self._log("q", q); self._log("k", k); self._log("v", v); self._log("attn_mask", attn_mask)
-            raise
-
-        if self.debug:
-            self._log("attn_output", attn_output)
-
-        attn_output = attn_output.transpose(1, 2).reshape(B, L_txt, -1)
-        if self.debug:
-            self._log("attn_output merged", attn_output)
-
-        attn_output = self.o_proj(attn_output)
-        if self.debug:
-            self._log("attn_output final", attn_output)
-
-        return attn_output, None
-
-
+# Qwen2 Decoder Block
 class Qwen2VLDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config: Qwen2VLConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.in_norm   = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp       = Qwen2MLP(config)
-        self.flex_attn = Qwen2FlexAttention(config, layer_idx)
+        self.hidden_size = config.hidden_size
+
+        if config.use_sliding_window and config._attn_implementation != "flash_attention_2":
+            logger.warning_once(
+                f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
+                "unexpected results may be encountered."
+            )
+        self.self_attn = QWEN2_VL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+
+        self.cross_attn = QWEN2_VL_CROSSATTN_CLASSES[config._attn_implementation](config, layer_idx)
+
+        self.mlp = Qwen2MLP(config)
+        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.vision_mixer = None
+        if config.vision_mamba_mixer_config.enable:
+            self.vision_mixer = Mamba2Block(config.vision_mamba_mixer_config, layer_idx)
+        
+        self.alpha = None
+        if config.use_alpha_balancing:
+            self.alpha = nn.Parameter(0.5 * torch.ones(1))
+        
+        self.cross_attn_use_position_embeddings = config.cross_attn_use_position_embeddings
+        self.cross_attn_use_layer_norm = config.cross_attn_use_layer_norm
 
     def forward(
         self,
-        hidden_states:       torch.Tensor,   # (1, L_txt, D)
-        image_hidden_states: torch.Tensor,   # (1, L_vis, D)
-        output_attentions:   bool = False,
+        hidden_states: torch.Tensor,
+        image_hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        encoder_seq_lens: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value_ca: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        encoder_position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cross_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ):
-        fusion = torch.cat([image_hidden_states, self.in_norm(hidden_states)], dim=1)
-        L_full = fusion.size(1); L_vis = image_hidden_states.size(1)
-
-        pos_full = torch.arange(L_full, device=fusion.device).unsqueeze(0)  # (1,L_full)
-        multimodal_mask = torch.zeros(L_full, dtype=torch.bool, device=fusion.device)
-        multimodal_mask[:L_vis] = True
-        multimodal_mask = multimodal_mask.unsqueeze(0)     # (1,L_full)
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
+                `(batch, sequence_length)` where padding elements are indicated by 0.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            use_cache (`bool`, *optional*):
+                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+                (see `past_key_values`).
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+                Indices depicting the position of the input sequence tokens in the sequence.
+            position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
+                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
+                with `head_dim` being the embedding dimension of each attention head.
+            kwargs (`dict`, *optional*):
+                Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
+                into the model
+        """
 
         residual = hidden_states
-        attn_out, attn_w = self.flex_attn(
-            fusion,
-            position_ids_full = pos_full,
-            multimodal_mask   = multimodal_mask,
-            output_attentions = output_attentions,
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        self_attn_hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
-        hidden_states = residual + attn_out
-        hidden_states = hidden_states + self.mlp(self.post_norm(hidden_states))
+
+        past_key_value_ca_len = len(past_key_value_ca) if past_key_value_ca is not None else 0
+
+        if self.cross_attn_use_layer_norm:
+            image_hidden_states = self.input_layernorm(image_hidden_states)
+
+        pos_emb = None
+        encoder_pos_emb = None
+        if self.cross_attn_use_position_embeddings:
+            pos_emb = position_embeddings
+            encoder_pos_emb = encoder_position_embeddings
+
+        # Cross Attention
+        cross_attn_hidden_states, _ = self.cross_attn(
+            hidden_states=hidden_states,
+            encoder_hidden_states=image_hidden_states,
+            attention_mask=attention_mask,
+            cross_attention_mask=cross_attention_mask,
+            position_ids=position_ids,
+            past_key_value_ca=past_key_value_ca,
+            output_attentions=output_attentions,
+            position_embeddings=pos_emb,
+            encoder_position_embeddings=encoder_pos_emb,
+            **kwargs,
+        )
+
+        if self.alpha is not None:
+            with torch.no_grad():
+                self.alpha.clamp_(0, 1)
+            hidden_states = residual + self.alpha * self_attn_hidden_states + (1 - self.alpha) * cross_attn_hidden_states
+        else:
+            hidden_states = residual + self_attn_hidden_states + cross_attn_hidden_states
+
+        if self.vision_mixer is not None and past_key_value_ca_len < self.layer_idx + 1:
+            if encoder_seq_lens is not None:
+                max_seq_len = max([sum(seq_len) for seq_len in encoder_seq_lens])
+                all_seq_idxs = []
+                for seq_len in encoder_seq_lens:
+                    repeats = torch.tensor(seq_len)
+                    indices = torch.arange(len(repeats))
+                    seq_idx = torch.repeat_interleave(indices, repeats).unsqueeze(0).to(torch.int32)
+                    all_seq_idxs.append(torch.cat([
+                        seq_idx, (seq_idx[0, -1].item() + 1) * torch.ones((1, max_seq_len - seq_idx.shape[1]), dtype=torch.int32)
+                    ], dim=1))
+                seq_idxs = torch.cat(all_seq_idxs, dim=0).to(image_hidden_states.device)
+                image_hidden_states = self.vision_mixer(image_hidden_states, seq_idx=seq_idxs)
+            else:
+                image_hidden_states = self.vision_mixer(image_hidden_states)
+            # image_hidden_states = self.mlp(image_hidden_states).clamp(-20, 20)
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
 
         if output_attentions:
-            layer_outputs = (hidden_states, attn_w, None)   # [0]=hs, [1]=attn, [2]=cache(None)
-        else:
-            layer_outputs = (hidden_states, None)           # [0]=hs, [1]=cache(None)
+            outputs += (self_attn_weights,)
 
-        return layer_outputs, image_hidden_states
+        if use_cache:
+            outputs += (present_key_value,)
 
-
+        return outputs, image_hidden_states
+    
     def reshape_packed_to_samples(self, x_packed, lengths_by_batch):
         device, dtype = x_packed.device, x_packed.dtype
         hidden_dim = x_packed.size(-1)
@@ -1986,7 +1972,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         cross_attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -2003,88 +1989,122 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        # set defaults
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # Determine hidden_states (text) from provided embeddings or input_ids
-        if text_embeds is not None:
-            hidden_states = text_embeds
-        elif inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        elif input_ids is not None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            raise ValueError("You must specify input_ids, inputs_embeds, or text_embeds")
-        bsz, seq_len, _ = hidden_states.size()
+        if (input_ids is None) ^ (text_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
 
-        # Build or expand position_ids
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+
+        if text_embeds is None:
+            text_embeds = self.embed_tokens(input_ids)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + text_embeds.shape[1], device=text_embeds.device
+            )
+
+        # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(bsz, -1)
-        if position_ids.dim() == 2:
-            position_ids = position_ids.unsqueeze(0).expand(3, bsz, -1)
+            position_ids = cache_position.view(1, 1, -1).expand(3, text_embeds.shape[0], -1)
+        elif position_ids.dim() == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        # Build causal mask
         causal_mask = self._update_causal_mask(
-            attention_mask, hidden_states, cache_position, past_key_values, output_attentions
+            attention_mask, text_embeds, cache_position, past_key_values, output_attentions
         )
 
-        # Set up vision embeddings
+        hidden_states = text_embeds
         image_hidden_states = visual_embeds
 
-        # Compute rotary position embeddings
-        pos_emb = self.rotary_emb(hidden_states, position_ids)
-        encoder_pos_emb = None
-        if encoder_position_ids is not None and image_hidden_states is not None:
-            encoder_pos_emb = self.rotary_emb(image_hidden_states, encoder_position_ids)
 
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        encoder_position_embeddings = None
+        if encoder_position_ids is not None:
+            encoder_position_embeddings = self.rotary_emb(image_hidden_states, encoder_position_ids)
+
+        # decoder layers
         all_hidden_states = () if output_hidden_states else None
-        all_attns = () if output_attentions else None
-        next_cache = None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
 
-        for layer in self.layers:
+        for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            layer_outputs, image_hidden_states = layer(
-                hidden_states,
-                image_hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                encoder_position_ids=encoder_position_ids,
-                encoder_seq_lens=encoder_seq_lens,
-                past_key_value=past_key_values,
-                past_key_value_ca=past_key_values_ca,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=pos_emb,
-                encoder_position_embeddings=encoder_pos_emb,
-                cross_attention_mask=cross_attention_mask,
-            )
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs, image_hidden_states = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    image_hidden_states,
+                    causal_mask,
+                    position_ids,
+                    encoder_seq_lens,
+                    past_key_values,
+                    past_key_values_ca,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                    encoder_position_embeddings,
+                    cross_attention_mask,
+                )
+            else:
+                layer_outputs, image_hidden_states = decoder_layer(
+                    hidden_states,
+                    image_hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    encoder_seq_lens=encoder_seq_lens,
+                    past_key_value=past_key_values,
+                    past_key_value_ca=past_key_values_ca,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    encoder_position_embeddings=encoder_position_embeddings,
+                    cross_attention_mask=cross_attention_mask,
+                )
+
             hidden_states = layer_outputs[0]
+
             if use_cache:
-                next_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
             if output_attentions:
-                all_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        if not return_dict:
-            outputs = (hidden_states, next_cache, all_hidden_states, all_attns)
-            return outputs if use_cache else (hidden_states, all_hidden_states, all_attns)
+        next_cache = next_decoder_cache if use_cache else None
 
+        if not return_dict:
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             past_key_values_ca=past_key_values_ca,
             hidden_states=all_hidden_states,
-            attentions=all_attns,
+            attentions=all_self_attns,
         )
 
     # Get updated causal mask
@@ -2836,44 +2856,6 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel):
         else:
             for module in self.model.layers:
                 module.cross_attn.load_state_dict(module.self_attn.state_dict())
-
-
-    def init_flex_attn_from_self_attn(self, ckpt_state_dict=None):
-
-        from transformers.deepspeed import is_deepspeed_zero3_enabled
-
-        if ckpt_state_dict is None:
-            ckpt_state_dict = self.state_dict()
-
-        rename_map = {
-            k: re.sub(r"\\.self_attn\\.", ".flex_attn.", k)
-            for k in ckpt_state_dict
-            if ".self_attn." in k
-        }
-        flex_sd = { new_k: ckpt_state_dict[old_k] for old_k, new_k in rename_map.items() }
-
-        if is_deepspeed_zero3_enabled():
-            import deepspeed
-            for layer in self.model.layers:
-                with deepspeed.zero.GatheredParameters(list(layer.flex_attn.parameters()), modifier_rank=0):
-                    miss, unexp = layer.flex_attn.load_state_dict(
-                        { k.split(f"layers.{layer.layer_idx}.flex_attn.")[1]: v
-                        for k, v in flex_sd.items()
-                        if k.startswith(f"model.layers.{layer.layer_idx}.flex_attn.") },
-                        strict=False
-                    )
-        else:
-            misses_total, unexp_total = 0, 0
-            for layer in self.model.layers:
-                prefix = f"model.layers.{layer.layer_idx}.flex_attn."
-                sub_sd = { k[len(prefix):]: v for k, v in flex_sd.items() if k.startswith(prefix) }
-                missing, unexpected = layer.flex_attn.load_state_dict(sub_sd, strict=False)
-                misses_total   += len(missing)
-                unexp_total    += len(unexpected)
-
-            print(f"[FlexInit] copied {len(flex_sd)} tensors → flex_attn "
-                f"(missing={misses_total}, unexpected={unexp_total})")
-
 
     def enable_input_require_grads(self):
         """
